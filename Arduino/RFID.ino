@@ -12,9 +12,9 @@
 #include <WiFiUdp.h>
 
 // Network credentials
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const char* serverUrl = "YOUR_BACKEND_URL"; // e.g., "http://your-server.com/api/rfid"
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+const char* attendanceUrl = "YOUR_BACKEND_URL/api/attendance";
 
 // Pin definitions
 #define SS_PIN  21
@@ -41,7 +41,6 @@ struct CardData {
 CardData registeredCards[MAX_CARDS];
 int numCards = 0;
 
-
 String getFormattedTime() {
   timeClient.update();
   time_t epochTime = timeClient.getEpochTime();
@@ -54,7 +53,6 @@ String getFormattedTime() {
   return String(buffer);
 }
 
-// Function to convert UID to hex string
 String uidToString(byte* uid, byte size) {
   String uidString = "";
   for (byte i = 0; i < size; i++) {
@@ -64,26 +62,54 @@ String uidToString(byte* uid, byte size) {
   return uidString;
 }
 
-// Function to send POST request
+// Function to check if card exists by querying attendance history
+bool checkCardExists(byte* uid, byte uidSize, String& existingName) {
+  if (WiFi.status() == WL_CONNECTED) {
+    String uidStr = uidToString(uid, uidSize);
+    // Query the last 30 days of attendance to find the card
+    String url = String(attendanceUrl) + "?days=30";
+    
+    http.begin(url);
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode == 200) {
+      String response = http.getString();
+      DynamicJsonDocument doc(16384); // Larger buffer for attendance data
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (!error) {
+        JsonArray data = doc["data"];
+        // Look for the most recent attendance record with matching UID
+        for (JsonVariant record : data) {
+          if (record["uid"].as<String>() == uidStr) {
+            existingName = record["name"].as<String>();
+            http.end();
+            return true;
+          }
+        }
+      }
+    }
+    http.end();
+  }
+  return false;
+}
+
 void sendPostRequest(const char* name, byte* uid, byte uidSize) {
   if (WiFi.status() == WL_CONNECTED) {
     StaticJsonDocument<200> doc;
     
-    // Format the fields exactly as expected by the API
     doc["Name"] = name;
     doc["UID"] = uidToString(uid, uidSize);
-    // Format time in ISO 8601 format
     String timestamp = getFormattedTime();
-    doc["Time"] = timestamp + ".000Z";  // Add milliseconds and Z for UTC
+    doc["Time"] = timestamp + ".000Z";
     
     String jsonString;
     serializeJson(doc, jsonString);
     
-    // Update the URL to match your endpoint
-    http.begin(serverUrl);
+    http.begin(attendanceUrl);
     http.addHeader("Content-Type", "application/json");
     
-    Serial.println("Sending data: " + jsonString);  // Debug print
+    Serial.println("Sending data: " + jsonString);
     
     int httpResponseCode = http.POST(jsonString);
     
@@ -100,12 +126,37 @@ void sendPostRequest(const char* name, byte* uid, byte uidSize) {
     Serial.println("WiFi not connected");
   }
 }
-// Rest of your original functions remain the same, but modify registerCard() and loop()
+
 void registerCard() {
   if (numCards >= MAX_CARDS) {
     Serial.println("Maximum number of cards reached!");
     return;
   }
+
+  // First check if card exists in database
+  String existingName;
+  if (checkCardExists(mfrc522.uid.uidByte, mfrc522.uid.size, existingName)) {
+    // Card exists, register it locally and mark attendance
+    registeredCards[numCards].uidLength = mfrc522.uid.size;
+    memcpy(registeredCards[numCards].uid, mfrc522.uid.uidByte, mfrc522.uid.size);
+    existingName.toCharArray(registeredCards[numCards].name, MAX_NAME_LENGTH);
+    registeredCards[numCards].valid = true;
+    
+    Serial.print("Card already registered for: ");
+    Serial.println(existingName);
+    
+    // Mark attendance
+    sendPostRequest(registeredCards[numCards].name, mfrc522.uid.uidByte, mfrc522.uid.size);
+    
+    numCards++;
+    
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    return;
+  }
+
+  // If card doesn't exist, proceed with new registration
   Serial.println("\nNew card detected! Enter name to register (max 19 chars):");
   
   while (!Serial.available()) {
@@ -121,10 +172,9 @@ void registerCard() {
     name.toCharArray(registeredCards[numCards].name, MAX_NAME_LENGTH);
     registeredCards[numCards].valid = true;
     
-    // Send POST request for new registration
     sendPostRequest(registeredCards[numCards].name, mfrc522.uid.uidByte, mfrc522.uid.size);
     
-    Serial.print("Successfully registered card for: ");
+    Serial.print("Successfully registered new card for: ");
     Serial.println(registeredCards[numCards].name);
     
     for (int i = 0; i < 2; i++) {
@@ -151,7 +201,6 @@ void setup() {
   Serial.begin(115200);
   while (!Serial);
   
-  // Connect to WiFi
   WiFi.begin(ssid, password);
   Serial.println("Connecting to WiFi...");
   while (WiFi.status() != WL_CONNECTED) {
@@ -160,9 +209,8 @@ void setup() {
   }
   Serial.println("\nWiFi connected");
   
-  // Initialize NTP
   timeClient.begin();
-  timeClient.setTimeOffset(0); // Adjust offset according to your timezone
+  timeClient.setTimeOffset(0);
   
   SPI.begin(18, 19, 23, 21);
   mfrc522.PCD_Init();
@@ -175,6 +223,7 @@ void setup() {
   Serial.println("RFID Card Registration and Reader System");
   Serial.println("Scan a card to begin...");
 }
+
 bool compareUID(byte* uid1, byte* uid2, byte size) {
     for (byte i = 0; i < size; i++) {
         if (uid1[i] != uid2[i]) {
@@ -183,6 +232,7 @@ bool compareUID(byte* uid1, byte* uid2, byte size) {
     }
     return true;
 }
+
 void loop() {
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
     delay(50);
@@ -195,7 +245,6 @@ void loop() {
     if (registeredCards[i].valid && 
         compareUID(mfrc522.uid.uidByte, registeredCards[i].uid, mfrc522.uid.size)) {
       
-      // Send POST request for card scan
       sendPostRequest(registeredCards[i].name, mfrc522.uid.uidByte, mfrc522.uid.size);
       
       Serial.print("\nWelcome, ");
